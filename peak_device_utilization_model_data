@@ -1,0 +1,226 @@
+--  create or replace TEMP table `site_data` as ( select  distinct serial_number,master_id,slot_date,site_name,from
+-- (Select serial_number, master_id,slot_date,site_name,
+-- ROW_NUMBER() OVER(PARTITION BY serial_number, slot_date ORDER BY site_name) AS first_created
+-- -- FROM `gms-ds-algorithms-sb.looker_data_modelling_eu.serial_number_master_id_mapping`
+-- from `viq-st-eu-p.viq_operation.t_device_store_carry_forward_history`
+--  where slot_date between "2024-01-01" and  "2024-01-31"  and master_id=96487 
+--  )where first_created = 1);
+
+-- CONCAT(CAST(EXTRACT(YEAR FROM DATE (device_date)) AS STRING),"-",CAST(EXTRACT(MONTH FROM DATE (device_date)) AS STRING)) AS yyyy_mm
+
+create or replace TEMP table `peak_data` as ( 
+select *,avg(avg_month) OVER(PARTITION BY sitename) AS avg_of_avg from(
+select *,avg(utilized_flag_1) OVER(PARTITION BY sitename,month) AS avg_month
+ from (
+select *,ROW_NUMBER() OVER(PARTITION BY sitename ORDER BY yyyy_mm) AS period,
+trim(SUBSTR(`yyyy_mm`, 6, 2)) AS month
+ from `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.peak_device_utilization_by_month_1` 
+where sitename = "859-Mansfield DO")));
+
+
+create or replace TEMP table `peak_data` as ( 
+select sitename,yyyy_mm,utilized_flag_0,ifnull(utilized_flag_1,0) as utilized_flag_1,
+total_devices,pct_device_utilized,num_peak_devices,num_regular_devices,
+ROW_NUMBER() OVER(PARTITION BY sitename ORDER BY yyyy_mm) AS period,
+trim(SUBSTR(`yyyy_mm`, 6, 2)) AS month
+ from `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.peak_device_utilization_by_month_7days` 
+where sitename = "859-Mansfield DO"
+);
+
+
+-- !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+-- !!!!!RUN MODEL FOR SEASONAL SITES!!!!!
+-- !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+create or replace TEMP table `peak_data` as ( 
+select *,
+ROW_NUMBER() OVER(PARTITION BY sitename ORDER BY yyyy_mm) AS period,
+trim(SUBSTR(`yyyy_mm`, 6, 2)) AS month
+ from
+`dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.peak_device_utilization_anlytc_model_seasdata` 
+);
+
+create or replace TEMP table `peak_avg_data` as ( 
+select *,avg(avg_month) OVER(PARTITION BY sitename) AS avg_of_avg from(
+select sitename,month,avg(ifnull(utilized_devices_model,0))  AS avg_month
+from peak_data
+group by sitename,month));
+
+create or replace TEMP table `datasn1` as (
+  select a.*,b.avg_month,b.avg_of_avg
+  from peak_data  as a left join peak_avg_data as b
+  on a.sitename = b.sitename and a.month=b.month
+ );
+
+create or replace TEMP table `datasn2` as (
+  select *,round(safe_divide(ifnull(utilized_devices_model,0),seas_index),3) as deseas from(
+  select *, round(safe_divide(avg_month,avg_of_avg),3) as seas_index
+  from datasn1)
+ );
+
+create or replace TEMP table `trend_reg` as (
+SELECT Bucket,
+       SLOPE,
+       (SUM_OF_Y - SLOPE * SUM_OF_X) / N AS INTERCEPT,
+       CORRELATION
+FROM (
+    SELECT Bucket,
+           N,
+           SUM_OF_X,
+           SUM_OF_Y,
+           CORRELATION * STDDEV_OF_Y / STDDEV_OF_X AS SLOPE,
+           CORRELATION
+    FROM (
+        SELECT Bucket,
+               COUNT(*) AS N,
+               SUM(X) AS SUM_OF_X,
+               SUM(Y) AS SUM_OF_Y,
+               STDDEV_POP(X) AS STDDEV_OF_X,
+               STDDEV_POP(Y) AS STDDEV_OF_Y,
+               CORR(X,Y) AS CORRELATION
+        FROM (SELECT sitename AS Bucket,
+                     period AS X,
+                     deseas AS Y
+              FROM datasn2)
+        WHERE Bucket IS NOT NULL AND
+              X IS NOT NULL AND
+              Y IS NOT NULL
+        GROUP BY Bucket)));
+    
+create or replace TEMP table `datasn3` as (
+  select a.*,b.intercept,b.slope
+  from datasn2  as a left join trend_reg as b
+  on a.sitename = b.Bucket 
+ );
+
+ create or replace TEMP table `fits` as (
+  select *,round(trend_line_est*seas_index,3) as pred from(
+  select *,round((intercept+slope*period),3) as trend_line_est
+    from datasn3)order by sitename,yyyy_mm
+ );
+
+--  create or replace  table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.peak_device_utilization_seas_nonseas_histpred` 
+--  as  (
+--   select sitename,yyyy_mm,utilized_devices_model, pred as predicted_utilized_devices_model from fits
+--   union all
+--   select sitename,yyyy_mm,utilized_devices_model,  predicted_utilized_devices_model from 
+--   `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.historical_prediction_nonseasonal` 
+--   order by sitename,yyyy_mm
+
+--  );
+
+
+
+create or replace TEMP table `model_eval_0` as (
+  select *,ifnull(round(abs_error/rmse,2),0) as err_in_terms_of_stddev,
+  ((1.96*rmse)) as stdev from(
+select *,sqrt(mse) as rmse,avg(pct_abs_error) over (partition by sitename) as mape from(
+select *,ifnull(abs_error/nullif(utilized_devices_model,0),0) as pct_abs_error,
+avg(squared_error) over (partition by sitename) as mse,
+avg(abs_error) over (partition by sitename) as mad from(
+select *, (residuals*residuals) as squared_error,abs(residuals) as abs_error,
+avg(residuals) over (partition by sitename) as bias,
+stddev(residuals) over (partition by sitename) as sigma,
+count(sitename) over (partition by sitename) as cnt from(
+select sitename,yyyy_mm,period, utilized_devices_model,pred,
+round(utilized_devices_model-pred,2) as residuals
+from fits ))))
+order by sitename,period ) ;
+
+create or replace TEMP table `rmse_0` as (
+select distinct sitename,bias,mse, mad,mape,rmse from model_eval_0);
+
+--  create or replace  table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.peak_device_utilization_model_eval` 
+--  as  (
+--   select  sitename,bias,mse, mad,mape ,rmse as stdev from rmse_0
+--   union all
+--   select sitename,bias,mse, mad,mape,stdev from 
+--   `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.model_evaluation_nonseasonal` 
+--   order by sitename
+--  );
+
+
+create or replace TEMP table `future_table_0` as (
+select *,CONCAT("2024","-",month) AS yyyy_mm,round(trend_line_fcst*seas_index,0) as predicted_utilized from(
+select *,max_hist_period+pre_period as period,(intercept+slope*(max_hist_period+pre_period)) as trend_line_fcst from(
+select *, ROW_NUMBER() OVER(PARTITION BY sitename order by cast(month as INT64)) AS pre_period from(
+select distinct sitename,month,max_hist_period,intercept,slope,seas_index,last_month from(
+select sitename,month,max(period) OVER(PARTITION BY sitename) AS max_hist_period,
+cast(last_value(month) over (partition by sitename order by sitename) as INT64) as last_month,intercept,slope,seas_index
+from fits)
+where cast(month as INT64) > last_month order by cast(month as INT64))))order by sitename,period)  ;
+
+create or replace TEMP table `pred_interval` as (
+select a.*,b.rmse 
+from future_table_0 as a left join rmse_0 as b
+on a.sitename=b.sitename
+order by sitename,period)  ;
+
+
+create or replace TEMP table `future_table_1` as (
+select sitename,yyyy_mm,slope,intercept,seas_index,trend_line_fcst,predicted_utilized,rmse,
+round(predicted_utilized-rmse) as predicted_utilized_devices_lower_limt,
+round(predicted_utilized+rmse) as predicted_utilized_devices_upper_limt,
+predicted_utilized - (LAG(predicted_utilized)  over (partition by sitename order by yyyy_mm) ) as extra_devices
+from pred_interval
+order by sitename,yyyy_mm);
+
+create or replace TEMP table `future_table_1_vars` as (
+select sitename,yyyy_mm,predicted_utilized as predicted_future_utilized_devices_model,
+predicted_utilized_devices_lower_limt as Lower_prediction_Limit,
+predicted_utilized_devices_upper_limt as Upper_prediction_Limit,
+extra_devices as estimated_additional_devices,
+rmse as stdev from future_table_1
+);
+
+create or replace TEMP table `future_table_nonseas` as (
+select sitename,
+concat(trim(substr(format_timestamp('%Y%m', prediction_date) ,1,4)),"-",trim(substr(format_timestamp('%Y%m', prediction_date) ,5,2))) as yyyy_mm,
+round(predicted_future_utilized_devices_model,0) as predicted_future_utilized_devices_model,
+CAST(Lower_prediction_Limit as float64) as Lower_prediction_Limit ,	
+CAST(Upper_prediction_Limit as float64) as Upper_prediction_Limit,	estimated_additional_devices,	stdev
+from  `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.model_results_nonseasonal` );
+
+create or replace TEMP table `comb_future_table` as (
+select * from future_table_1_vars
+union all
+select * from future_table_nonseas
+order by sitename,yyyy_mm);
+
+
+create or replace TEMP table `future_table_2` as (
+select 
+   sitename,
+    max(case when yyyy_mm = '2024-11' THEN predicted_future_utilized_devices_model end) predicted_devices_2024_11,   
+    max(case when yyyy_mm = '2024-11' THEN Lower_prediction_Limit end) 
+       predicted_utilized_devices_lower_limt_2024_11,    
+    max(case when yyyy_mm = '2024-11' THEN Upper_prediction_Limit end) 
+        predicted_utilized_devices_upper_limt_2024_11,    
+    max(case when yyyy_mm = '2024-12' THEN predicted_future_utilized_devices_model end) predicted_devices_2024_12,
+    max(case when yyyy_mm = '2024-12' THEN Lower_prediction_Limit end) 
+       predicted_utilized_devices_lower_limt_2024_12,    
+    max(case when yyyy_mm = '2024-12' THEN Upper_prediction_Limit end) 
+        predicted_utilized_devices_upper_limt_2024_12,
+    max(case when yyyy_mm = '2024-11' THEN round(stdev,2) end) stdev,    
+    max(case when yyyy_mm = '2024-11' THEN estimated_additional_devices end) est_additonal_peak_devices_2024_11, 
+    max(case when yyyy_mm = '2024-12' THEN estimated_additional_devices end) est_additonal_peak_devices_2024_12,
+from comb_future_table
+-- where sitename = "1123-Eltham DO"
+group by sitename);
+
+-- Final output table
+create or replace  table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.peak_device_utilization_seasdata_summary` 
+ as ( select * from future_table_2);
+
+-- Get input table
+create or replace  table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.monthly_peak_device_utilization_anlytc` as (
+select a.*,round((ifnull(a.num_peak_devices_utilized,0)/total_num_peak_devices_matched)*100,2) as pct_peak_device_utilized
+from `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.monthly_device_utilization_anlytc` as a
+inner join `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.peak_device_utilization_seasdata_summary` as b
+on a.sitename=b.sitename 
+order by a.sitename,a.yyyy_mm);
+
+
+
+
+
