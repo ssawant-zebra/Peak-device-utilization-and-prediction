@@ -1,0 +1,276 @@
+ create or replace TEMP table `site_data` as ( select  distinct serial_number,master_id,slot_date,site_name,from
+(Select serial_number, master_id,slot_date,site_name,
+ROW_NUMBER() OVER(PARTITION BY serial_number, slot_date ORDER BY site_name) AS first_created
+-- FROM `gms-ds-algorithms-sb.looker_data_modelling_eu.serial_number_master_id_mapping`
+from `viq-st-eu-p.viq_operation.t_device_store_carry_forward_history`
+ where slot_date between "2024-01-01" and  "2024-01-31"  and master_id=96487 
+ )where first_created = 1);
+
+
+-- CONCAT(CAST(EXTRACT(YEAR FROM DATE (device_date)) AS STRING),"-",CAST(EXTRACT(MONTH FROM DATE (device_date)) AS STRING)) AS yyyy_mm
+
+create or replace TEMP table `datas2` as ( 
+select *,
+row_number() over (partition by sitename,serial_num,device_date,in_operation_status, seqnum - seqnum_s order by device_hour) as streak from (
+select *,row_number() over (partition by sitename,serial_num,device_date order by device_hour) as seqnum,
+row_number() over (partition by sitename,serial_num,device_date,in_operation_status order by device_hour) as seqnum_s from (
+select * ,format_date('%Y-%m', device_date) as yyyy_mm
+from(
+SELECT prod_key, asset_name,serial_num,sitename,in_operation_status,
+extract(date from TIMESTAMP(record_timestamp)) AS device_date,
+extract(hour from TIMESTAMP(record_timestamp)) AS device_hour,
+ COUNT(DISTINCT(serial_num)) OVER(PARTITION BY sitename,EXTRACT(date FROM TIMESTAMP(record_timestamp))) AS total_sn_cnt,
+FROM `viq-st-eu-p.viq_operation.t_opdevbq_biz_bq_persistent` 
+WHERE TIMESTAMP_TRUNC(record_timestamp, DAY) between TIMESTAMP("2022-09-01") and TIMESTAMP("2024-07-31")
+and MasterID = "96487"  
+-- and sitename = "1123-Eltham DO"
+-- prod_key = "22168522515192" and in_operation_status = "Utilized"  "1259-Taunton DO" and upper(asset_name) like '%PEAK%' and TIMESTAMP_TRUNC(record_timestamp, DAY) as record_date,
+group by 1,2,3,4,5,record_timestamp) where   device_hour between 7 and 18
+order by sitename,yyyy_mm,serial_num,device_date,device_hour)
+order by sitename,yyyy_mm,serial_num,device_date,device_hour)
+order by sitename,yyyy_mm,serial_num,device_date,device_hour);
+
+-- This table gives number of hours the devices is different state(util,un-util,ooc) daily.
+create or replace TEMP table `datas3` as ( 
+select sitename,yyyy_mm,serial_num,prod_key,asset_name,device_date,in_operation_status,max(streak) as utilized_hour from
+datas2 
+group by sitename,yyyy_mm,serial_num,prod_key,asset_name,device_date,in_operation_status
+order by sitename,yyyy_mm,serial_num,prod_key,asset_name,device_date,in_operation_status);
+
+-- Transpose table
+
+create or replace TEMP table `datas4` as (
+select 
+   sitename,yyyy_mm,serial_num,prod_key,asset_name,device_date,
+    max(case when in_operation_status = 'Utilized' THEN utilized_hour end) utilized,   
+    max(case when in_operation_status = 'Un-Utilized' THEN utilized_hour end) un_utilized,
+      max(case when in_operation_status = 'Out of Contact' THEN utilized_hour end) ooc,
+from datas3
+-- where sitename = "328-Derby DO"
+group by sitename,yyyy_mm,serial_num,prod_key,asset_name,device_date
+order by sitename,yyyy_mm,serial_num,prod_key,asset_name,device_date);
+
+
+-- total_sn_cnt shows that the change in daily number of devices and also flag days with device utilized
+create or replace TEMP table `datas5` as ( 
+select * ,COUNT(DISTINCT(serial_num)) OVER(PARTITION BY sitename,device_date) AS total_daily_sn_cnt,
+CASE
+      WHEN (utilized is Not NULL )  THEN 1
+    ELSE
+     0
+    END AS daily_utilized_flag from datas4
+order by sitename,yyyy_mm,serial_num,prod_key,asset_name,device_date);
+
+-- site-monthly
+create or replace TEMP table `datas6` as ( 
+SELECT sitename,yyyy_mm,serial_num,COUNT(DISTINCT(serial_num)) OVER(PARTITION BY sitename,yyyy_mm) AS total_devices, 
+sum(daily_utilized_flag) as days_utilized_irresp_of_unutilized,
+FROM datas5 
+group by sitename,yyyy_mm,serial_num);
+
+--  to exclude sn that were not utilized in that month
+create or replace TEMP table `aggregate_tbl_util` as ( 
+SELECT  sitename,yyyy_mm,count(days_utilized_irresp_of_unutilized) as utilized_devices,max(total_devices) as total_devices
+FROM datas6 
+where days_utilized_irresp_of_unutilized >0
+group by sitename,yyyy_mm
+order by sitename,yyyy_mm);
+
+create or replace TEMP table `aggregate_tbl_unutil` as ( 
+SELECT  sitename,yyyy_mm,count(days_utilized_irresp_of_unutilized) as un_utilized_ooc_devices
+FROM datas6 
+where days_utilized_irresp_of_unutilized =0
+group by sitename,yyyy_mm
+order by sitename,yyyy_mm);
+
+create or replace TEMP table `aggregate_tbl` as ( 
+SELECT  a.*,b.un_utilized_ooc_devices
+from aggregate_tbl_util as a left join aggregate_tbl_unutil as b
+on a.sitename = b.sitename and a.yyyy_mm=b.yyyy_mm
+order by sitename,yyyy_mm);
+
+
+-- Note: It is possible to match by serial number only, a device can be utilized in different site in different month,
+-- so it is necessary to count utilized peak devices only.
+create or replace TEMP table `peak_data_jocasta` as ( 
+select a.*,b.*
+from datas6 as a left join `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.peak_device_data_from_jacosta`  as b
+on a.serial_num = cast(b.Serial_Number AS STRING)
+order by sitename,yyyy_mm,serial_num);
+
+--  days_utilized_irresp_of_unutilized >0 to exclude serial_num that were not utilized or not present at the site in that month.
+-- there are peak devices present in non peak months so applied the filter to get the devices that were utilized.
+-- devices also keep moving from site to site.
+create or replace TEMP table `peak_data_summary` as ( 
+SELECT sitename,yyyy_mm,count(*) as num_peak_devices_utilized from (select
+* FROM peak_data_jocasta
+where asset_no is NOT NULL and days_utilized_irresp_of_unutilized >0)
+group by sitename,yyyy_mm
+order by sitename,yyyy_mm);
+
+create or replace TEMP table `peak_data_summary_all` as ( 
+SELECT sitename,yyyy_mm,count(*) as total_num_peak_devices_matched from (select
+* FROM peak_data_jocasta
+where asset_no is NOT NULL )
+group by sitename,yyyy_mm
+order by sitename,yyyy_mm);
+
+
+create or replace  TEMP table `peak_device_utilization_by_month` as ( 
+SELECT sitename,yyyy_mm ,un_utilized_ooc_devices,ifnull(utilized_devices,0) as utilized_devices,total_devices,
+ifnull(utilized_devices,0)/total_devices as pct_device_utilized
+from aggregate_tbl
+order by sitename,yyyy_mm);
+
+create or replace TEMP table `monthly_device_utilization_anlytc_summ` as ( 
+select a.*,b.num_peak_devices_utilized,
+ifnull((a.utilized_devices - ifnull(b.num_peak_devices_utilized,0)),utilized_devices) as num_regular_devices_utilized,
+c.total_num_peak_devices_matched
+from peak_device_utilization_by_month as a left join peak_data_summary  as b
+on a.sitename = b.sitename and a.yyyy_mm = b.yyyy_mm
+left join peak_data_summary_all  as c
+on a.sitename = c.sitename and a.yyyy_mm = c.yyyy_mm
+order by sitename,yyyy_mm);
+
+create or replace TEMP table `monthly_device_utilization_anlytc`  as 
+( select *, ifnull((total_devices-total_num_peak_devices_matched),total_devices) as total_regular_devices,
+(total_num_peak_devices_matched-num_peak_devices_utilized) as total_peak_devices_unutilized
+from monthly_device_utilization_anlytc_summ
+order by sitename,yyyy_mm);
+
+--  remove any peak device noise from non peak months
+create or replace TEMP table `data_prep`  as 
+( select *, CASE
+      WHEN (yyyy_mm in ('2022-11','2022-12','2023-11','2023-12'))  THEN 
+                  (ifnull(num_peak_devices_utilized,0)+ifnull(num_regular_devices_utilized,0)) 
+      ELSE
+                   ifnull(num_regular_devices_utilized,0)
+      END AS utilized_devices_model
+ from `monthly_device_utilization_anlytc`  
+ order by sitename,yyyy_mm);   
+
+create or replace TEMP table `distinct_yyyy_mm` as ( 
+select distinct yyyy_mm
+from data_prep  
+order by yyyy_mm);
+
+create or replace TEMP table `sites` as ( 
+select distinct sitename
+from data_prep
+order by sitename);
+
+create or replace TEMP table `site_yearmon` as ( 
+select a.*,b.*
+from sites  as a 
+cross join distinct_yyyy_mm  as b
+order by sitename,yyyy_mm);
+
+create or replace TEMP table `model_data` as ( 
+select a.*,b.un_utilized_ooc_devices,b.utilized_devices,b.total_devices,b.pct_device_utilized,
+b.num_peak_devices_utilized,b.total_num_peak_devices_matched,
+b.num_regular_devices_utilized,b.total_regular_devices,b.total_peak_devices_unutilized,
+b.utilized_devices_model
+from site_yearmon  as a 
+left join data_prep   as b
+on a.sitename = b.sitename and a.yyyy_mm=b.yyyy_mm
+order by sitename,yyyy_mm);
+
+create or replace table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.monthly_device_utilization_anlytc`  as ( 
+select * except(utilized_devices_model),ifnull(utilized_devices_model,0) utilized_devices_model from(
+select * except(utilized_devices_model),  
+    first_value(utilized_devices_model ignore nulls) over win as utilized_devices_model
+from (
+SELECT * except(utilized_devices_model),
+       last_value(utilized_devices_model ignore nulls) OVER( PARTITION BY sitename ORDER BY yyyy_mm ) as utilized_devices_model
+ FROM model_data)
+window win as (partition by sitename order by yyyy_mm rows between current row and unbounded following)) order by sitename,yyyy_mm) ;
+
+-- Select sites with seasonal data for modeling
+create or replace TEMP table `sitewise_peak_data` as (
+select distinct sitename,season_period from(
+select *,cast(substr(yyyy_mm,1,4) as int64) as year,
+COUNT(sitename) OVER(PARTITION BY sitename) AS season_period from(
+SELECT * FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.monthly_device_utilization_anlytc` 
+where yyyy_mm in ('2022-11','2022-12','2023-11','2023-12') and num_peak_devices_utilized>0)));
+
+create or replace TEMP table `site_with_seasonal_data` as (
+select  sitename,season_period from sitewise_peak_data
+where season_period >2
+order by season_period desc);
+
+create or replace  table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.peak_device_utilization_anlytc_model_seasdata` as ( 
+select a.*
+from `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.monthly_device_utilization_anlytc`  as a 
+inner join site_with_seasonal_data  as b
+on a.sitename = b.sitename 
+order by sitename,yyyy_mm);
+
+-- This query will select sites which had peak devices either in 2022 or in 2023
+-- create or replace TEMP table `sites_with_no_seasonal_data` as (
+-- select  sitename,season_period from sitewise_peak_data
+-- where season_period in (1,2)
+-- order by season_period desc);
+
+-- This query will select sites which had peak devices only in 2023
+create or replace TEMP table `sites_with_no_seasonal_data_2023` as (
+select * from(
+select *,COUNT(year) OVER(PARTITION BY sitename) AS season_year from (
+select distinct sitename, year from (
+select *,cast(substr(yyyy_mm,1,4) as int64) as year,
+COUNT(sitename) OVER(PARTITION BY sitename) AS season_period from(
+SELECT * FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.monthly_device_utilization_anlytc` 
+where yyyy_mm in ('2022-11','2022-12','2023-11','2023-12') and num_peak_devices_utilized>0))))
+where season_year = 1 and year = 2023);
+
+create or replace  table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.peak_device_utilization_anlytc_model_nonseasdata` as ( 
+select a.*
+from `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.monthly_device_utilization_anlytc`  as a 
+inner join sites_with_no_seasonal_data_2023  as b
+on a.sitename = b.sitename 
+order by sitename,yyyy_mm);
+
+-- select sites with no peak devies shipped
+create or replace TEMP table `sitewise_no_peak_data` as (
+select distinct sitename,season_period from(
+select sitename, sum(total_num_peak_devices_matched) AS season_period from(
+SELECT sitename,cast(substr(yyyy_mm,1,4) as int64) as year,total_num_peak_devices_matched   
+FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.monthly_device_utilization_anlytc` 
+where yyyy_mm in ('2022-11','2022-12','2023-11','2023-12'))group by sitename)
+where season_period is NULL);
+
+-- sites with peak devices shipped only in 2022
+-- combines these sites with no peak data
+create or replace TEMP table `sites_with_no_seasonal_data_2022` as (
+select sitename,1 as season_period from(
+select *,COUNT(year) OVER(PARTITION BY sitename) AS season_year from (
+select distinct sitename, year from (
+select *,cast(substr(yyyy_mm,1,4) as int64) as year,
+COUNT(sitename) OVER(PARTITION BY sitename) AS season_period from(
+SELECT * FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.monthly_device_utilization_anlytc` 
+where yyyy_mm in ('2022-11','2022-12','2023-11','2023-12') and num_peak_devices_utilized>0))))
+where season_year = 1 and year = 2022);
+
+create or replace TEMP table `sites_with_no_peak_data` as (
+  select * from sitewise_no_peak_data
+  union all
+  select * from sites_with_no_seasonal_data_2022
+);
+
+
+create or replace  table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.peak_device_utilization_anlytc_model_nopeakdata` as ( 
+select a.*
+from `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.monthly_device_utilization_anlytc`  as a 
+inner join sitewise_no_peak_data  as b 
+on a.sitename = b.sitename 
+order by sitename,yyyy_mm);
+
+-- !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+--  To get distinct count of pek devices in 2022 and 2023 in peak months
+-- !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+-- SELECT sitename,year,count(distinct serial_num) as total_num_peak_devices_matched from (
+-- SELECT  * ,cast(substr(yyyy_mm,1,4) as int64) as year 
+-- FROM `dmsanlytc-cssanlytc-eu-d._script8ac66e9e69f83fd27e12dee3317e0c08a5b81f43.peak_data_jocasta` 
+-- where Asset_no is not null 
+-- and yyyy_mm in ('2022-11','2022-12','2023-11','2023-12'))
+-- group by sitename,year
